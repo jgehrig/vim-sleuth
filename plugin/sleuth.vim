@@ -1,28 +1,49 @@
 " sleuth.vim - Heuristically set buffer options
-" Maintainer:   Tim Pope <http://tpo.pe/>
-" Version:      1.1
-" GetLatestVimScripts: 4375 1 :AutoInstall: sleuth.vim
 
-if exists("g:loaded_sleuth") || v:version < 700 || &cp
+if exists('g:loaded_sleuth') || v:version < 700 || &cp
   finish
 endif
 let g:loaded_sleuth = 1
 
+let g:sleuth_neighbor_limit = get(g:, 'sleuth_neighbor_limit', 20)
+let g:sleuth_line_guess_limit = get(g:, 'sleuth_line_guess_limit', 1024)
+
+" Finds the most common space indentation size. Given a dict where:
+"   key: Difference in leading spaces between sequential lines.
+"   value: The number of times the key/delta above has appeared.
+" Returns the indentation length of the most common key
+function! s:most_common_indent(delta_sizes) abort
+  let max_indent = 0
+  let max_count = 0
+  for [indent_size, indent_count] in items(a:delta_sizes)
+    if indent_count > max_count
+      let max_indent = indent_size
+      let max_count = indent_count
+    endif
+  endfor
+
+  return max_indent
+endfunction
+
+" Guess the most likely indentation scheme based on the provided buffer lines.
+" Returns an 'options' array of vim indentation settings.
 function! s:guess(lines) abort
-  let options = {}
-  let heuristics = {'spaces': 0, 'hard': 0, 'soft': 0}
   let ccomment = 0
   let podcomment = 0
   let triplequote = 0
   let backtick = 0
   let xmlcomment = 0
-  let softtab = repeat(' ', 8)
+
+  let heuristics = {'spaces': 0, 'sizes': {}, 'hard': 0}
+  let last_leading_spaces = 0
 
   for line in a:lines
+    " Whitespace-only lines are ignored
     if !len(line) || line =~# '^\s*$'
       continue
     endif
 
+    " Common multi-line comments are ignored (Python, C, XML, etc)
     if line =~# '^\s*/\*'
       let ccomment = 1
     endif
@@ -71,115 +92,166 @@ function! s:guess(lines) abort
       continue
     endif
 
+    " Computes total number of lines with leading tabs
     if line =~# '^\t'
       let heuristics.hard += 1
-    elseif line =~# '^' . softtab
-      let heuristics.soft += 1
+      continue
     endif
-    if line =~# '^  '
+
+    " Computes total number of lines with leading spaces
+    if line =~# '^ '
       let heuristics.spaces += 1
-    endif
-    let indent = len(matchstr(substitute(line, '\t', softtab, 'g'), '^ *'))
-    if indent > 1 && (indent < 4 || indent % 2 == 0) &&
-          \ get(options, 'shiftwidth', 99) > indent
-      let options.shiftwidth = indent
+
+      " Determine how many spaces constitute an indent-level. Compute the most common
+      " deltas in the quantity of leading spaces between sequential lines. The most
+      " frequent length is shiftwidth. Inspired by 'Comparing Lines' described at:
+      " https://medium.com/firefox-developer-tools/detecting-code-indentation-eff3ed0fb56b
+      if line =~# '^ \+\t'
+        " Tab size not known, so mixed indent lines are not useful data
+        continue
+      endif
+
+      let leading_spaces = len(matchstr(line, '^ *'))
+      let indent_size = abs(leading_spaces - last_leading_spaces)
+      if indent_size > 1
+        let heuristics.sizes[indent_size] = get(heuristics.sizes, indent_size, 0) + 1
+        let last_leading_spaces = leading_spaces
+      endif
     endif
   endfor
 
-  if heuristics.hard && !heuristics.spaces
-    return {'expandtab': 0, 'shiftwidth': &tabstop}
-  elseif heuristics.soft != heuristics.hard
-    let options.expandtab = heuristics.soft > heuristics.hard
-    if heuristics.hard
-      let options.tabstop = 8
-    endif
+  " No heuristics, unable to determine indentation scheme
+  if !(heuristics.hard) && !(heuristics.spaces)
+    return {}
   endif
 
-  return options
+  " More tabs than spaces, use tab indentation
+  if heuristics.hard > heuristics.spaces
+    return {'expandtab': 0, 'shiftwidth': &tabstop}
+  endif
+
+  " More spaces than tabs, use space indentation
+  if len(heuristics.sizes) > 0
+    let indent_size = s:most_common_indent(heuristics.sizes)
+    return {'expandtab': 1, 'shiftwidth': indent_size}
+  endif
+
+  " Unable to determine indentation scheme
+  return {}
 endfunction
 
+" Given a vim 'syntax' string, find all associated file types.
+" Returns a list of buffer name glob patterns.
 function! s:patterns_for(type) abort
   if a:type ==# ''
     return []
   endif
-  if !exists('s:patterns')
-    redir => capture
-    silent autocmd BufRead
-    redir END
-    let patterns = {
-          \ 'c': ['*.c'],
-          \ 'html': ['*.html'],
-          \ 'sh': ['*.sh'],
-          \ 'vim': ['vimrc', '.vimrc', '_vimrc'],
-          \ }
-    let setfpattern = '\s\+\%(setf\%[iletype]\s\+\|set\%[local]\s\+\%(ft\|filetype\)=\|call SetFileTypeSH(["'']\%(ba\|k\)\=\%(sh\)\@=\)'
-    for line in split(capture, "\n")
-      let match = matchlist(line, '^\s*\(\S\+\)\='.setfpattern.'\(\w\+\)')
-      if !empty(match)
-        call extend(patterns, {match[2]: []}, 'keep')
-        call extend(patterns[match[2]], [match[1] ==# '' ? last : match[1]])
-      endif
-      let last = matchstr(line, '\S.*')
-    endfor
-    let s:patterns = patterns
-  endif
-  return copy(get(s:patterns, a:type, []))
+
+  redir => capture
+  silent autocmd BufRead
+  redir END
+
+  " Search for 'setf {type}', match all leading '*.{extension}'
+  let patterns = []
+  let setf_regex  = '^\s*\(\S\+\).*setf.' . a:type
+  for line in split(capture, '\n')
+    let match = matchlist(line, setf_regex)
+    if !empty(match)
+      call add(patterns, match[1])
+    endif
+  endfor
+
+  " Sleuth will not accept patterns containing '/', remove
+  call filter(patterns, 'v:val !~# "/"')
+
+  return patterns
 endfunction
 
+" Apply 'options' if it contains valid indentation settings
 function! s:apply_if_ready(options) abort
   if !has_key(a:options, 'expandtab') || !has_key(a:options, 'shiftwidth')
     return 0
-  else
-    for [option, value] in items(a:options)
-      call setbufvar('', '&'.option, value)
-    endfor
-    return 1
   endif
+
+  for [option, value] in items(a:options)
+    call setbufvar('', '&'.option, value)
+  endfor
+  return 1
 endfunction
 
-function! s:detect() abort
-  if &buftype ==# 'help'
-    return
+" Determine indentation for the current buffer based on the settings of its neighbors.
+"   Looks at the current value of 'filetype' for all associated file types. Moving from
+"   the current directory to the root directory, 's:guess' is applied until a file is found
+"   with valid indentation settings. Only 'g:sleuth_neighbor_limit' files are examined.
+" Returns an 'options' array of vim indentation settings.
+function! s:detect_options_neighbors() abort
+  let file_limit = g:sleuth_neighbor_limit
+  if file_limit <= 0
+    return {}
   endif
 
-  let options = s:guess(getline(1, 1024))
-  if s:apply_if_ready(options)
-    return
+  let patterns = s:patterns_for(&filetype)
+
+  " Without file type associations, nothing can be done
+  if len(patterns) == 0
+    return {}
   endif
-  let c = get(b:, 'sleuth_neighbor_limit', get(g:, 'sleuth_neighbor_limit', 20))
-  let patterns = c > 0 ? s:patterns_for(&filetype) : []
-  call filter(patterns, 'v:val !~# "/"')
-  let dir = expand('%:p:h')
-  while isdirectory(dir) && dir !=# fnamemodify(dir, ':h') && c > 0
+
+  let options = {}
+  let current_dir = expand('%:p:h')
+  while isdirectory(current_dir) && current_dir !=# fnamemodify(current_dir, ':h') && file_limit > 0
     for pattern in patterns
-      for neighbor in split(glob(dir.'/'.pattern), "\n")[0:7]
-        if neighbor !=# expand('%:p') && filereadable(neighbor)
+      for neighbor in split(glob(current_dir.'/'.pattern), '\n')[0:7]
+        if neighbor ==# expand('%:p')
+          continue
+        endif
+        if filereadable(neighbor)
           call extend(options, s:guess(readfile(neighbor, '', 256)), 'keep')
-          let c -= 1
+          let file_limit -= 1
         endif
-        if s:apply_if_ready(options)
+        if len(options) > 0
           let b:sleuth_culprit = neighbor
-          return
+          return options
         endif
-        if c <= 0
+        if file_limit <= 0
           break
         endif
       endfor
-      if c <= 0
+      if file_limit <= 0
         break
       endif
     endfor
-    let dir = fnamemodify(dir, ':h')
+    let current_dir = fnamemodify(current_dir, ':h')
   endwhile
-  if has_key(options, 'shiftwidth')
-    return s:apply_if_ready(extend({'expandtab': 1}, options))
+
+  return {}
+endfunction
+
+function! s:detect() abort
+  " Vim provides sane defaults for certain buffers
+  if &buftype ==# 'help' || &buftype ==# 'quickfix'
+    return
+  endif
+
+  " Examine current buffer for indentation scheme
+  let options = s:guess(getline(1, g:sleuth_line_guess_limit))
+  if s:apply_if_ready(options)
+    return
+  endif
+
+  " Examine surrounding files for indentation scheme
+  let options = s:detect_options_neighbors()
+  if s:apply_if_ready(options)
+    return
   endif
 endfunction
 
-setglobal smarttab
-
-if !exists('g:did_indent_on')
+" Sleuth global settings defaults, allow the user to override
+if get(g:, 'sleuth_default_options', 1) && !exists('g:sleuth_did_defaults')
+  setglobal smarttab
   filetype indent on
+  setbufvar('', '&tabstop', 8)
+  let g:sleuth_did_defaults = 1
 endif
 
 function! SleuthIndicator() abort
